@@ -116,7 +116,10 @@ Respond ONLY in this exact JSON format, no other text:
     }}
   ],
   "core_reason": string,
-  "demographic_lens": string
+  "demographic_lens": string  // ONE specific sentence: exactly how your age, 
+// geography, politics, or values shape this reaction.
+// Example: "As a 52-year-old conservative from rural Tennessee, 
+// the casual depiction of sex work as normal employment deeply offends my values."
 }}"""
 
 
