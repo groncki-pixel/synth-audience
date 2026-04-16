@@ -378,7 +378,7 @@ async def measure_collapse_rate(
         script_text=script_text,
         decomposition=decomposition,
         model=model,
-        batch_size=min(5, sample_size),
+        batch_size=1,
     )
     rate = len(results) / sample_size if sample_size > 0 else 0.0
     print(f"\nCollapse rate diagnostic: {rate:.0%} first-attempt pass rate "
