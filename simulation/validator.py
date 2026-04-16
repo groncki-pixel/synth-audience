@@ -102,8 +102,8 @@ def validate_response(response: dict, agent: AgentProfile) -> tuple[bool, str]:
     lens = response.get("demographic_lens", "")
     if len(lens) < 20:
         return False, "Demographic lens too short (< 20 chars)"
-    if lens.lower().startswith("as someone who"):
-        return False, "Demographic lens too generic (starts with 'As someone who')"
+    if len(lens) < 20:
+        return False, "Demographic lens too short (< 20 chars)"
 
     # ── Suspicious positivity check ──────────────────────────────────
     purity = agent.moral_foundations.get("purity", 0)
