@@ -94,9 +94,7 @@ $$T_{child} = \alpha \cdot T_{parent} + (1-\alpha)\cdot \varepsilon$$
 
 $$\mathbf{T}_{child} = \alpha \cdot \mathbf{T}_{parent\_avg} + (1-\alpha)\cdot \boldsymbol{\varepsilon}$$
 
-where 
-$\mathbf{T}_{parent\text{avg}} = \frac{\sum_{p \in parents} w_p \mathbf{T}_p}{\sum_p w_p}$ 
-and $w_p$ are parent weights (default equal unless household metadata indicates primary caregiver).
+where $\mathbf{T}_{parent\text{\_avg}} = \frac{\sum_{p \in parents} w_p \mathbf{T}_p}{\sum_p w_p}$ and $w_p$ are parent weights (default equal unless household metadata indicates primary caregiver).
 
 **Implementation notes**
 - After computing, clamp each component to $[0,1]$.
