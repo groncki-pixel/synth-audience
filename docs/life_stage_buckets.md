@@ -9,7 +9,7 @@ age_cutoffs:
   young_professional: "23-34"
   adult: "35-64"
   older_adult: "65+"
-created_by: "Copilot"
+created_by: "TG"
 ---
 
 # Life Stage Buckets
