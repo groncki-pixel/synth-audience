@@ -22,3 +22,4 @@ content/decompositions/*
 *.egg-info/
 dist/
 build/
+.env*
