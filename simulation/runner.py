@@ -1,9 +1,9 @@
 """
-Async batch agent runner calling Ollama at localhost:11434/api/chat.
+Async batch agent runner with pluggable inference providers.
 
-Orchestrates the full simulation: for each agent, builds prompts, calls
-Ollama, parses JSON, validates against collapse heuristics, retries on
-failure with strengthened anchoring.
+Orchestrates the full simulation: for each agent, builds prompts, calls the
+configured provider (Ollama, Gemini, or Claude), parses JSON, validates
+against collapse heuristics, retries on failure with strengthened anchoring.
 
 Design patterns from OpenClaw reference:
   - pi-embedded-runner/run.ts: retry loop with failover classification,
@@ -12,7 +12,7 @@ Design patterns from OpenClaw reference:
   - context-window-guard.ts: pre-flight context size check before each call
 
 Key constraints:
-  - All calls go to Ollama locally via httpx (no external APIs)
+  - Provider abstraction allows local Ollama or hosted Gemini/Claude
   - Batch size defaults to 5 to avoid overwhelming local GPU
   - Every response goes through validator.py before acceptance
   - Failed validation triggers retry up to 3 times
@@ -20,7 +20,10 @@ Key constraints:
   - All outputs saved as JSONL to simulation/outputs/
 
 Usage:
-    python -m simulation.runner --model mistral --script content/scripts/anora_act1.txt
+    python -m simulation.runner --provider ollama --model mistral \\
+        --script content/scripts/anora_act1.txt \\
+        --decomposition content/decompositions/anora_act1.json \\
+        --agents agents/profiles/anora.json
 """
 
 from __future__ import annotations
@@ -28,7 +31,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import sys
 import time
 from pathlib import Path
 from typing import Optional
@@ -36,17 +38,19 @@ from typing import Optional
 import httpx
 
 from agents.schemas import AgentProfile, AgentReaction, AgentResult
-from simulation.context_guard import guard_context, estimate_tokens
-from simulation.inference_config import (
-    AGENT_CONFIG,
-    OLLAMA_BASE_URL,
-    OLLAMA_CHAT_ENDPOINT,
-    config_to_ollama_options,
-)
+from simulation.context_guard import guard_context
+from simulation.cost_tracker import CostTracker
+from simulation.inference_config import AGENT_CONFIG, OLLAMA_BASE_URL
 from simulation.prompts import (
     REACTION_PROMPT_TEMPLATE,
     build_system_prompt,
     build_user_prompt,
+)
+from simulation.providers import (
+    ClaudeProvider,
+    GeminiProvider,
+    InferenceProvider,
+    OllamaProvider,
 )
 from simulation.validator import validate_response
 
@@ -64,20 +68,18 @@ OUTPUT_DIR = Path("simulation/outputs")
 
 
 # ---------------------------------------------------------------------------
-# Ollama health check
+# Ollama health check (kept for backward compat; only meaningful for Ollama)
 # ---------------------------------------------------------------------------
 
-async def check_ollama_available(client: httpx.AsyncClient) -> bool:
-    """Verify Ollama is reachable before starting a population run."""
-    try:
-        resp = await client.get(OLLAMA_BASE_URL, timeout=5.0)
-        return resp.status_code == 200
-    except (httpx.ConnectError, httpx.TimeoutException):
-        return False
+async def check_ollama_available(provider: InferenceProvider) -> bool:
+    """Verify Ollama is reachable. Returns True for non-Ollama providers."""
+    if not isinstance(provider, OllamaProvider):
+        return True
+    return await provider.health_check()
 
 
 # ---------------------------------------------------------------------------
-# Single agent call
+# Backward-compatible thin wrapper around OllamaProvider
 # ---------------------------------------------------------------------------
 
 async def _call_ollama(
@@ -87,38 +89,14 @@ async def _call_ollama(
     user_prompt: str,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
 ) -> Optional[str]:
-    """
-    Make a single Ollama /api/chat call. Returns the raw response text
-    or None on transport/timeout failure.
-    """
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        "stream": False,
-        "options": config_to_ollama_options(AGENT_CONFIG),
-    }
-
-    try:
-        resp = await client.post(
-            OLLAMA_CHAT_ENDPOINT,
-            json=payload,
-            timeout=timeout_seconds,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return data.get("message", {}).get("content", "")
-    except httpx.TimeoutException:
-        log.warning("Ollama call timed out after %ss", timeout_seconds)
-        return None
-    except httpx.HTTPStatusError as exc:
-        log.warning("Ollama HTTP error: %s", exc.response.status_code)
-        return None
-    except httpx.ConnectError:
-        log.error("Cannot connect to Ollama at %s", OLLAMA_BASE_URL)
-        return None
+    """Backward-compatible wrapper used by external callers and older tests."""
+    provider = OllamaProvider(model=model, client=client)
+    return await provider.generate(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        config=AGENT_CONFIG,
+        timeout_seconds=timeout_seconds,
+    )
 
 
 def _extract_json(raw: str) -> Optional[dict]:
@@ -128,26 +106,21 @@ def _extract_json(raw: str) -> Optional[dict]:
     """
     text = raw.strip()
 
-    # Strip markdown code fences
     if text.startswith("```"):
-        # Find the end of the opening fence line
         first_newline = text.index("\n") if "\n" in text else len(text)
         text = text[first_newline + 1:]
         if text.endswith("```"):
             text = text[:-3].strip()
 
-    # Try direct parse first
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
 
-    # Try to find JSON object in the text
     brace_start = text.find("{")
     if brace_start == -1:
         return None
 
-    # Walk forward to find the matching closing brace
     depth = 0
     in_string = False
     escape = False
@@ -181,13 +154,13 @@ def _extract_json(raw: str) -> Optional[dict]:
 # ---------------------------------------------------------------------------
 
 async def run_single_agent(
-    client: httpx.AsyncClient,
     agent: AgentProfile,
     script_text: str,
     decomposition: dict,
-    model: str,
+    provider: Optional[InferenceProvider] = None,
     context_window_tokens: int = 8192,
     max_retries: int = DEFAULT_MAX_RETRIES,
+    cost_tracker: Optional[CostTracker] = None,
 ) -> Optional[AgentResult]:
     """
     Run a single agent through the simulation with retry logic.
@@ -199,19 +172,19 @@ async def run_single_agent(
 
     Returns AgentResult on success, None if all retries exhausted.
     """
+    if provider is None:
+        provider = OllamaProvider()
+
     decomposition_json = json.dumps(decomposition, indent=2)
 
-    # Build the mutable persona description (may be strengthened on retry)
     current_description = agent.natural_language_description
 
     for attempt in range(1, max_retries + 1):
-        # Build prompts with current (possibly strengthened) description
         modified_agent = agent.model_copy()
         object.__setattr__(modified_agent, "natural_language_description", current_description)
 
         system_prompt = build_system_prompt(modified_agent)
 
-        # Context guard: truncate script if needed
         safe_script = guard_context(
             system_prompt=system_prompt,
             user_prompt_template=REACTION_PROMPT_TEMPLATE,
@@ -222,21 +195,30 @@ async def run_single_agent(
 
         user_prompt = build_user_prompt(safe_script, decomposition_json)
 
-        # Call Ollama
-        raw_response = await _call_ollama(client, model, system_prompt, user_prompt)
+        raw_response = await provider.generate(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            config=AGENT_CONFIG,
+            timeout_seconds=DEFAULT_TIMEOUT_SECONDS,
+        )
+        if cost_tracker is not None and raw_response is not None:
+            cost_tracker.record(
+                provider=provider.name,
+                model=provider.model,
+                input_tokens=getattr(provider, "last_input_tokens", 0),
+                output_tokens=getattr(provider, "last_output_tokens", 0),
+            )
         if raw_response is None:
-            log.warning("Agent %s attempt %d: no response from Ollama",
+            log.warning("Agent %s attempt %d: no response from provider",
                         agent.agent_id, attempt)
             continue
 
-        # Parse JSON
         parsed = _extract_json(raw_response)
         if parsed is None:
             log.warning("Agent %s attempt %d: JSON parse failed",
                         agent.agent_id, attempt)
             continue
 
-        # Validate
         is_valid, reason = validate_response(parsed, agent)
         if is_valid:
             try:
@@ -258,7 +240,6 @@ async def run_single_agent(
         log.info("Agent %s attempt %d failed validation: %s",
                  agent.agent_id, attempt, reason)
 
-        # Strengthen anchoring for next retry
         if attempt == 1:
             current_description += (
                 "\n\nCRITICAL: React directly. No hedging. No 'while' clauses. "
@@ -285,27 +266,36 @@ async def run_population(
     agents: list[AgentProfile],
     script_text: str,
     decomposition: dict,
-    model: str = DEFAULT_MODEL,
+    provider: Optional[InferenceProvider] = None,
     batch_size: int = DEFAULT_BATCH_SIZE,
     context_window_tokens: int = 8192,
     output_path: Optional[Path] = None,
+    cost_path: Optional[Path] = None,
 ) -> list[AgentResult]:
     """
     Run a full population of agents through the simulation.
 
-    Agents are processed in batches to avoid overwhelming Ollama.
-    Results are written incrementally to JSONL as they complete.
+    Agents are processed in batches to avoid overwhelming the provider.
+    Results are written incrementally to JSONL as they complete; a per-run
+    cost summary is written alongside.
     """
+    if provider is None:
+        provider = OllamaProvider()
+
+    timestamp = int(time.time())
     if output_path is None:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        timestamp = int(time.time())
         output_path = OUTPUT_DIR / f"run_{timestamp}.jsonl"
+    else:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+    if cost_path is None:
+        cost_path = output_path.parent / f"cost_{timestamp}.json"
 
     results: list[AgentResult] = []
+    cost_tracker = CostTracker()
 
-    async with httpx.AsyncClient() as client:
-        # Pre-flight: check Ollama is available
-        if not await check_ollama_available(client):
+    try:
+        if not await check_ollama_available(provider):
             log.error(
                 "Ollama is not available at %s. "
                 "Start Ollama before running the simulation.",
@@ -314,8 +304,10 @@ async def run_population(
             return []
 
         total = len(agents)
-        log.info("Starting population run: %d agents, batch_size=%d, model=%s",
-                 total, batch_size, model)
+        log.info(
+            "Starting population run: %d agents, batch_size=%d, provider=%s, model=%s",
+            total, batch_size, provider.name, provider.model,
+        )
 
         with open(output_path, "w") as out_file:
             for i in range(0, total, batch_size):
@@ -323,12 +315,12 @@ async def run_population(
 
                 tasks = [
                     run_single_agent(
-                        client=client,
                         agent=agent,
                         script_text=script_text,
                         decomposition=decomposition,
-                        model=model,
+                        provider=provider,
                         context_window_tokens=context_window_tokens,
+                        cost_tracker=cost_tracker,
                     )
                     for agent in batch
                 ]
@@ -338,7 +330,6 @@ async def run_population(
                 for result in batch_results:
                     if result is not None:
                         results.append(result)
-                        # Write incrementally to JSONL
                         out_file.write(result.model_dump_json() + "\n")
                         out_file.flush()
 
@@ -346,12 +337,40 @@ async def run_population(
                 valid = len(results)
                 log.info("Completed %d/%d agents (%d valid so far)",
                          completed, total, valid)
+    finally:
+        # Best-effort: close Ollama's owned client if we created it
+        aclose = getattr(provider, "aclose", None)
+        if aclose is not None:
+            try:
+                await aclose()
+            except Exception:
+                pass
 
+    cost_tracker.save(cost_path)
     log.info("Population run complete: %d/%d agents produced valid results",
-             len(results), total)
+             len(results), len(agents))
     log.info("Results saved to %s", output_path)
+    log.info("Cost summary saved to %s", cost_path)
 
     return results
+
+
+# ---------------------------------------------------------------------------
+# Provider factory
+# ---------------------------------------------------------------------------
+
+def build_provider(name: str, model: Optional[str] = None) -> InferenceProvider:
+    """Construct the InferenceProvider matching a CLI provider choice."""
+    name = name.lower()
+    if name == "ollama":
+        return OllamaProvider(model=model or DEFAULT_MODEL)
+    if name == "gemini":
+        from simulation.providers import DEFAULT_GEMINI_MODEL
+        return GeminiProvider(model=model or DEFAULT_GEMINI_MODEL)
+    if name == "claude":
+        from simulation.providers import DEFAULT_CLAUDE_MODEL
+        return ClaudeProvider(model=model or DEFAULT_CLAUDE_MODEL)
+    raise ValueError(f"Unknown provider: {name}")
 
 
 # ---------------------------------------------------------------------------
@@ -362,22 +381,16 @@ async def measure_collapse_rate(
     agents: list[AgentProfile],
     script_text: str,
     decomposition: dict,
-    model: str = DEFAULT_MODEL,
+    provider: Optional[InferenceProvider] = None,
     sample_size: int = 20,
 ) -> float:
-    """
-    Run a small sample to measure first-attempt pass rate.
-    Use this before scaling to full population.
-
-    Returns the pass rate as a float (0.0 to 1.0).
-    Above 0.8 → proceed. Below 0.6 → strengthen prompts first.
-    """
+    """Run a small sample to measure first-attempt pass rate."""
     sample = agents[:sample_size]
     results = await run_population(
         agents=sample,
         script_text=script_text,
         decomposition=decomposition,
-        model=model,
+        provider=provider,
         batch_size=1,
     )
     rate = len(results) / sample_size if sample_size > 0 else 0.0
@@ -394,8 +407,11 @@ def main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser(description="Run synth-audience simulation")
-    parser.add_argument("--model", default=DEFAULT_MODEL,
-                        help="Ollama model name (default: mistral)")
+    parser.add_argument("--provider", default="ollama",
+                        choices=["ollama", "gemini", "claude"],
+                        help="Inference provider to use")
+    parser.add_argument("--model", default=None,
+                        help="Model name (defaults depend on provider)")
     parser.add_argument("--script", required=True,
                         help="Path to script text file")
     parser.add_argument("--decomposition", required=True,
@@ -415,7 +431,6 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    # Load inputs
     script_text = Path(args.script).read_text()
 
     with open(args.decomposition) as f:
@@ -425,19 +440,21 @@ def main() -> None:
         agents_data = json.load(f)
     agents = [AgentProfile(**a) for a in agents_data]
 
+    provider = build_provider(args.provider, args.model)
+
     if args.diagnostic:
         asyncio.run(measure_collapse_rate(
             agents=agents,
             script_text=script_text,
             decomposition=decomposition,
-            model=args.model,
+            provider=provider,
         ))
     else:
         results = asyncio.run(run_population(
             agents=agents,
             script_text=script_text,
             decomposition=decomposition,
-            model=args.model,
+            provider=provider,
             batch_size=args.batch_size,
             context_window_tokens=args.context_window,
         ))
