@@ -60,7 +60,15 @@ Children drive early franchise affinity and long‑term IP value; family viewing
 ### Adolescent
 
 **Age range**
+
+11–15
+
+**Behavioral profile**
+
+Adolescents are in a transitional phase with increasing autonomy but still strongly shaped by household norms. They occupy school and peer group contexts where identity and status begin to form. Dominant platforms are TikTok, Snapchat, YouTube, and Discord; peer clusters and school networks amplify trends rapidly.
+
 **Typical daily media pathways**
+
 - Morning: short social feeds during commute or before school  
 - Afternoon: school peer sharing, Discord or group chat interactions  
 - Evening: TikTok/YouTube bingeing and sharing with friends
@@ -222,6 +230,3 @@ Life‑stage buckets convert demographic labels into behavioral personas that pr
 
 ---
 
-
-Adolescents are in a transitional phase with increasing autonomy but still strongly shaped by household norms. They occupy school and peer group contexts where identity and status begin to form. Dominant platforms are TikTok, Snapchat, YouTube, and Discord; peer clusters and school networks amplify trends rapidly.
-11–15
