@@ -16,6 +16,7 @@ aggregation/reports/*
 !aggregation/reports/.gitkeep
 content/scripts/*
 !content/scripts/.gitkeep
+!content/scripts/sample.txt
 content/decompositions/*
 !content/decompositions/.gitkeep
 .DS_Store
@@ -23,3 +24,4 @@ content/decompositions/*
 dist/
 build/
 .env*
+outputs/
